@@ -1,0 +1,6 @@
+{
+  "name": "PC Health Check & Auto-Fix",
+  "description": "Aplicativo desktop e dashboard de diagnóstico profundo e resolução automática para Windows com CustomTkinter, psutil e PowerShell.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
