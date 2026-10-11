@@ -6,6 +6,11 @@ import {defineConfig} from 'vite';
 export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss()],
+    build: {
+      // dist/ é a saída do PyInstaller (o .exe); o Vite limpa outDir antes de gerar,
+      // então o demo web usa uma pasta própria para não apagar o executável.
+      outDir: 'web-dist',
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

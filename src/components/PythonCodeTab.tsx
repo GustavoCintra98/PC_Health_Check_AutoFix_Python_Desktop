@@ -13,7 +13,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { PYTHON_PROJECT_FILES, PythonFileItem } from '../data/pythonSourceCode';
+import { PYTHON_PROJECT_FILES, fileContentForDownload } from '../data/pythonSourceCode';
 
 export const PythonCodeTab: React.FC = () => {
   const [selectedFileId, setSelectedFileId] = useState<string>('main');
@@ -29,7 +29,7 @@ export const PythonCodeTab: React.FC = () => {
   };
 
   const handleDownloadSingleFile = () => {
-    const blob = new Blob([currentFile.code], { type: 'text/plain;charset=utf-8' });
+    const blob = new Blob([fileContentForDownload(currentFile)], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -45,9 +45,9 @@ export const PythonCodeTab: React.FC = () => {
       setIsZipping(true);
       const zip = new JSZip();
       
-      // Add all project files to zip
+      // Inclui testes e configs: o build_exe.bat roda o pytest antes de compilar
       PYTHON_PROJECT_FILES.forEach(item => {
-        zip.file(item.filename, item.code);
+        zip.file(item.filename, fileContentForDownload(item));
       });
 
       const zipBlob = await zip.generateAsync({ type: 'blob' });
@@ -115,7 +115,7 @@ export const PythonCodeTab: React.FC = () => {
             <Terminal className="h-4 w-4 text-cyan-400 shrink-0" />
             <span>Passo 1: Instale as bibliotecas</span>
             <span className="rounded bg-slate-900 border border-slate-700 px-2 py-0.5 text-cyan-300">
-              pip install customtkinter psutil wmi pywin32
+              pip install -r requirements.txt
             </span>
           </div>
 
@@ -179,17 +179,17 @@ export const PythonCodeTab: React.FC = () => {
             <span>Elevação UAC Transparente</span>
           </h4>
           <p className="text-xs text-slate-400">
-            O <code className="text-slate-300">main.py</code> consulta <code className="text-slate-300">ctypes.windll.shell32.IsUserAnAdmin()</code>. Se não estiver elevado, reinvoca o executável via verbo <code className="text-cyan-400">'runas'</code> sem abrir janelas de console duplicadas.
+            O <code className="text-slate-300">main.py</code> consulta <code className="text-slate-300">IsUserAnAdmin()</code> e, se preciso, reinicia via verbo <code className="text-cyan-400">'runas'</code>. Se o UAC for recusado, o app abre em modo limitado e desativa as opções que exigem Administrador.
           </p>
         </div>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-2">
           <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
             <Layers className="h-4 w-4 text-cyan-400" />
-            <span>Execução Não-Bloqueante (Threads)</span>
+            <span>Threads + Fila Thread-Safe</span>
           </h4>
           <p className="text-xs text-slate-400">
-            A interface <code className="text-slate-300">CustomTkinter</code> roda em loop principal enquanto o diagnóstico e os reparos executam em <code className="text-slate-300">threading.Thread(daemon=True)</code>, mantendo a GUI 100% fluida durante chamadas demoradas de SFC ou DISM.
+            Diagnóstico e reparos rodam em threads de trabalho; logs e progresso chegam à <code className="text-slate-300">CustomTkinter</code> por uma <code className="text-slate-300">queue.Queue</code> consumida na thread principal, com progresso por etapa e cancelamento entre etapas.
           </p>
         </div>
 
@@ -199,7 +199,7 @@ export const PythonCodeTab: React.FC = () => {
             <span>Compilação Standalone (.exe)</span>
           </h4>
           <p className="text-xs text-slate-400">
-            Com o script <code className="text-slate-300">build_exe.bat</code> fornecido, é gerado um arquivo <code className="text-slate-300">PC_Health_Check_AutoFix.exe</code> único com manifesto de Administrador embutido (<code className="text-purple-300">--uac-admin</code>) via PyInstaller.
+            O <code className="text-slate-300">build_exe.bat</code> instala as dependências, roda os testes e gera o <code className="text-slate-300">PC_Health_Check_AutoFix.exe</code> pelo <code className="text-purple-300">.spec</code>, com manifesto de Administrador embutido (<code className="text-purple-300">uac_admin=True</code>).
           </p>
         </div>
       </div>

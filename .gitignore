@@ -13,6 +13,7 @@ dist/
 
 # Web demo (Vite/Bun)
 node_modules/
+web-dist/
 .env
 
 # Diversos
