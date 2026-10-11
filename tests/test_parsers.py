@@ -6,6 +6,7 @@ from diagnostics import (
     ProcessInfo, classify_service, parse_defrag_output, parse_ping_output,
     parse_sfc_output, select_offenders,
 )
+from fixer import parse_winget_failures
 
 PING_PT = """
 Disparando 8.8.8.8 com 32 bytes de dados:
@@ -122,3 +123,45 @@ def test_select_offenders_ignores_small_and_critical():
     assert [p.name for p in cpu_only] == ["render.exe"]
     both = select_offenders(procs, cpu_bottleneck=True, ram_bottleneck=True)
     assert sorted(p.name for p in both) == ["bigmem.exe", "render.exe"]
+
+
+# Trecho real de `winget upgrade --all` (pt-BR), com uma falha no meio
+WINGET_PT = """
+(5/15) Encontrado Microsoft .NET Windows Desktop Runtime 10.0 [Microsoft.DotNet.DesktopRuntime.10] Versão 10.0.12
+Instalado com êxito
+(6/15) Encontrado Epic Games Launcher [EpicGames.EpicGamesLauncher] Versão 1.3.210.0
+Este aplicativo é licenciado para você pelo proprietário.
+Iniciando a instalação do pacote...
+O instalador falhou com o código de saída: 1603
+O registro do instalador está disponível em: C:\\Users\\x\\EpicGames.log
+(7/15) Encontrado Microsoft ASP.NET Core Runtime 8.0 [Microsoft.DotNet.AspNetCore.8] Versão 8.0.31
+Instalado com êxito
+(8/15) Encontrado EA app [ElectronicArts.EADesktop] Versão 13.805.11.6320
+Desinstalado com êxito
+Instalado com êxito
+(9/15) Encontrado Claude [Anthropic.Claude] Versão 2.19675.1
+Instalado com êxito. Reinicie o aplicativo para concluir a atualização.
+"""
+
+WINGET_EN = """
+(1/3) Found Git [Git.Git] Version 2.55.0.5
+Successfully installed
+(2/3) Found Some Tool [Vendor.Tool] Version 2.0
+Installer hash does not match; this cannot be overridden when running as admin
+(3/3) Found Other [Vendor.Other] Version 1.1
+Installer failed with exit code: 0x80070005
+"""
+
+
+def test_parse_winget_failures_pt():
+    assert parse_winget_failures(WINGET_PT) == ["Epic Games Launcher (código 1603)"]
+
+
+def test_parse_winget_failures_en():
+    assert parse_winget_failures(WINGET_EN) == ["Some Tool", "Other (código 0x80070005)"]
+
+
+def test_parse_winget_failures_unknown_language_reports_nothing():
+    """Sem reconhecer a mensagem de sucesso, não dá para afirmar que algo falhou."""
+    output = "(1/1) Gefunden Git [Git.Git] Version 2.55\nErfolgreich installiert\n"
+    assert parse_winget_failures(output) == []

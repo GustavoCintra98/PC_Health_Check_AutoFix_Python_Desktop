@@ -128,6 +128,18 @@ def test_deletion_progress_is_throttled_by_time(monkeypatch):
     assert len(lines) == 1
 
 
+def test_winget_step_lists_failed_packages(monkeypatch):
+    output = ("(1/2) Encontrado Git [Git.Git] Versão 2.55\nInstalado com êxito\n"
+              "(2/2) Encontrado Epic Games Launcher [EpicGames.EpicGamesLauncher] Versão 1.3\n"
+              "O instalador falhou com o código de saída: 1603\n")
+    monkeypatch.setattr(fixer, "stream_cmd", lambda *a, **k: CmdResult(0x8A15002C - (1 << 32), output))
+    report = FixReport()
+    AutoFixEngine().update_software_winget(report)
+    step = report.steps[-1]
+    assert step.status == "warning"
+    assert step.detail == "Falharam: Epic Games Launcher (código 1603)"
+
+
 def test_describe_plan_mentions_risks():
     diag = _healthy_diag(network_online=False, image_health=None,
                          offending_processes=[ProcessInfo(1234, "app.exe", 90, 10, 1, False, 1.0)])

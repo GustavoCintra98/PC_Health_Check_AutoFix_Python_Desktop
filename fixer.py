@@ -198,6 +198,39 @@ def _winget_line_filter(log: Callable[[str], None]) -> Callable[[str], None]:
     return _filter
 
 
+_WINGET_PACKAGE_RE = re.compile(r"^\(\d+/\d+\)\s+\S+\s+(.+?)\s+\[[^\]]+\]")
+_WINGET_SUCCESS_RE = re.compile(r"Instalado com êxito|Successfully installed", re.IGNORECASE)
+_WINGET_EXIT_CODE_RE = re.compile(r"(?:código de saída|exit code)\s*:\s*(0x[0-9A-Fa-f]+|-?\d+)", re.IGNORECASE)
+
+
+def parse_winget_failures(output: str) -> List[str]:
+    """
+    Extrai da saída de `winget upgrade --all` os pacotes que não foram instalados,
+    ex.: ["Epic Games Launcher (código 1603)"].
+
+    Cada pacote começa com "(i/n) Encontrado Nome [Id] Versão x"; um bloco sem a
+    mensagem de sucesso é considerado falha. Se nenhum bloco tiver a mensagem de
+    sucesso (idioma do winget não reconhecido), devolve lista vazia para não
+    acusar falha em pacotes que podem ter sido instalados.
+    """
+    blocks: List[List] = []  # [nome, sucesso, código]
+    for line in output.splitlines():
+        line = line.strip()
+        match = _WINGET_PACKAGE_RE.match(line)
+        if match:
+            blocks.append([match.group(1), False, None])
+        elif blocks:
+            if _WINGET_SUCCESS_RE.search(line):
+                blocks[-1][1] = True
+            else:
+                code = _WINGET_EXIT_CODE_RE.search(line)
+                if code:
+                    blocks[-1][2] = code.group(1)
+    if not any(ok for _, ok, _ in blocks):
+        return []
+    return [name + (f" (código {code})" if code else "") for name, ok, code in blocks if not ok]
+
+
 def _service_status(name: str) -> str:
     if not psutil:
         return "unknown"
@@ -582,8 +615,14 @@ try {
             report.add("Winget", "ok", "Aplicativos atualizados" if code == 0 else "Nenhuma atualização disponível")
             self._log("[OK] Atualização via winget concluída.")
         else:
-            report.add("Winget", "warning", f"Alguns pacotes falharam (código 0x{code:08X}); veja o log")
-            self._log(f"[!] Winget terminou com código 0x{code:08X}: alguns pacotes podem não ter sido atualizados.")
+            failures = parse_winget_failures(res.output)
+            if failures:
+                detail = "Falharam: " + "; ".join(failures)
+                self._log(f"[!] Winget: {len(failures)} pacote(s) não foram atualizados: {'; '.join(failures)}.")
+            else:
+                detail = f"Alguns pacotes falharam (código 0x{code:08X}); veja o log"
+                self._log(f"[!] Winget terminou com código 0x{code:08X}: alguns pacotes podem não ter sido atualizados.")
+            report.add("Winget", "warning", detail)
 
     # ---------------------------------------------------------------- Execução
 
