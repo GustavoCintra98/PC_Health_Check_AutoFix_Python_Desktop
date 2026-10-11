@@ -1,0 +1,18 @@
+[project]
+name = "pc-health-check-autofix"
+version = "3.0.0"
+description = "Diagnóstico e reparo automático para Windows 10/11"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 150
+target-version = "py39"
+extend-exclude = ["build", "dist", "src", "node_modules"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B008"]
