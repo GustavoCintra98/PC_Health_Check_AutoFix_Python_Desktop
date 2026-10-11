@@ -164,6 +164,31 @@ class _ProgressLineFilter:
         self.log(f"[{self.prefix}] {line}")
 
 
+class _DeletionProgress:
+    """
+    Registra o andamento de exclusões longas (ex.: 300 mil arquivos no cache do
+    Windows Update levam minutos) a cada `interval` segundos, para o app não
+    parecer travado. Limitar por tempo, e não por quantidade, mantém o log
+    enxuto tanto em discos rápidos quanto lentos.
+    """
+
+    def __init__(self, label: str, log: Callable[[str], None], interval: float = 3.0):
+        self.label = label
+        self.log = log
+        self.interval = interval
+        self.deleted = 0
+        self.freed = 0
+        self.next_report = time.monotonic() + interval
+
+    def add(self, size: int) -> None:
+        self.deleted += 1
+        self.freed += size
+        now = time.monotonic()
+        if now >= self.next_report:
+            self.next_report = now + self.interval
+            self.log(f"[{self.label}] {self.deleted} arquivos removidos ({self.freed / (1024 * 1024):.0f} MB) até agora...")
+
+
 def _winget_line_filter(log: Callable[[str], None]) -> Callable[[str], None]:
     """Remove spinners e barras de download do winget."""
     def _filter(line: str) -> None:
@@ -273,21 +298,21 @@ try {
         """
         self._log("[Auto-Fix] Iniciando limpeza de arquivos temporários...")
         protected = get_protected_paths()
-        deleted, skipped, freed = 0, 0, 0
+        progress = _DeletionProgress("Limpeza", self._log)
+        skipped = 0
         for folder in get_temp_dirs():
             self._log(f"[*] Limpando diretório: {folder}")
             for path, size in iter_old_files(folder, TEMP_MIN_AGE_HOURS, protected):
                 if delete_file(path):
-                    deleted += 1
-                    freed += size
+                    progress.add(size)
                 else:
                     skipped += 1
             remove_empty_dirs(folder, TEMP_MIN_AGE_HOURS, protected)
 
-        report.temp_files_deleted = deleted
+        report.temp_files_deleted = progress.deleted
         report.temp_files_skipped = skipped
-        report.temp_space_freed_mb = round(freed / (1024 * 1024), 2)
-        detail = f"{deleted} arquivos removidos ({report.temp_space_freed_mb} MB); {skipped} em uso ignorados"
+        report.temp_space_freed_mb = round(progress.freed / (1024 * 1024), 2)
+        detail = f"{progress.deleted} arquivos removidos ({report.temp_space_freed_mb} MB); {skipped} em uso ignorados"
         report.add("Limpeza de temporários", "ok", detail)
         self._log(f"[OK] Limpeza concluída: {detail}.")
 
@@ -505,17 +530,20 @@ try {
         else:
             win_dir = os.environ.get("SystemRoot", r"C:\Windows")
             download_dir = os.path.join(win_dir, "SoftwareDistribution", "Download")
-            deleted, skipped = 0, 0
+            progress = _DeletionProgress("Windows Update", self._log)
+            skipped = 0
             if os.path.isdir(download_dir):
-                for path, _ in iter_old_files(download_dir, 0):
+                self._log(f"[*] Limpando diretório: {download_dir}")
+                for path, size in iter_old_files(download_dir, 0):
                     if delete_file(path):
-                        deleted += 1
+                        progress.add(size)
                     else:
                         skipped += 1
                 remove_empty_dirs(download_dir)
             report.winupdate_cache_cleared = skipped == 0
             status = "ok" if skipped == 0 else "warning"
-            detail = f"{deleted} arquivos de cache removidos" + (f"; {skipped} bloqueados" if skipped else "")
+            detail = (f"{progress.deleted} arquivos de cache removidos ({progress.freed / (1024 * 1024):.0f} MB)"
+                      + (f"; {skipped} bloqueados" if skipped else ""))
             report.add("Windows Update", status, detail + ". Abra Configurações > Windows Update e clique em 'Verificar atualizações'.")
             self._log(f"[OK] Cache do Windows Update limpo: {detail}.")
 

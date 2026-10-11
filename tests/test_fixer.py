@@ -110,6 +110,24 @@ def test_kill_skips_reused_pid(monkeypatch):
     assert report.killed_processes == []
 
 
+def test_deletion_progress_is_throttled_by_time(monkeypatch):
+    """Exclusões longas devem mostrar andamento, mas sem uma linha de log por arquivo."""
+    clock = [0.0]
+    monkeypatch.setattr(fixer.time, "monotonic", lambda: clock[0])
+    lines = []
+    progress = fixer._DeletionProgress("Teste", lines.append, interval=3.0)
+    for _ in range(1000):  # 1000 arquivos em 1 s: nenhum log
+        clock[0] += 0.001
+        progress.add(1024 * 1024)
+    assert lines == []
+    clock[0] = 3.5
+    progress.add(1024 * 1024)
+    assert progress.deleted == 1001
+    assert lines == ["[Teste] 1001 arquivos removidos (1001 MB) até agora..."]
+    progress.add(0)  # logo em seguida: ainda dentro do intervalo
+    assert len(lines) == 1
+
+
 def test_describe_plan_mentions_risks():
     diag = _healthy_diag(network_online=False, image_health=None,
                          offending_processes=[ProcessInfo(1234, "app.exe", 90, 10, 1, False, 1.0)])
