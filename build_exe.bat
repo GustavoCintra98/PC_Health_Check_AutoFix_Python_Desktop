@@ -1,13 +1,28 @@
 @echo off
-:: Script para compilar o PC Health Check & Auto-Fix em um executável autônomo (.exe) com UAC embutido
+:: Compila o PC Health Check & Auto-Fix em um executavel autonomo (.exe) com manifesto UAC.
+:: Toda a configuracao fica em PC_Health_Check_AutoFix.spec (fonte unica de verdade).
 title Compilador PyInstaller - PC Health Check
+cd /d "%~dp0"
 
-echo [*] Instalando PyInstaller...
-pip install pyinstaller
+set "PY=python"
+where python >nul 2>&1 || set "PY=py -3"
 
-echo [*] Compilando executavel com manifesto de Administrador (uac-admin)...
-pyinstaller --noconsole --onefile --uac-admin --name="PC_Health_Check_AutoFix" --hidden-import="wmi" --hidden-import="win32timezone" main.py
+echo [*] Instalando dependencias de build...
+%PY% -m pip install -r requirements-dev.txt --quiet --disable-pip-version-check || goto :erro
+
+echo [*] Executando testes...
+%PY% -m pytest -q || goto :erro
+
+echo [*] Compilando executavel...
+%PY% -m PyInstaller --clean --noconfirm PC_Health_Check_AutoFix.spec || goto :erro
 
 echo.
-echo [OK] Compilacao concluida! O executavel esta na pasta: dist/PC_Health_Check_AutoFix.exe
+echo [OK] Compilacao concluida! Executavel: dist\PC_Health_Check_AutoFix.exe
 pause
+exit /b 0
+
+:erro
+echo.
+echo [-] Falha na compilacao.
+pause
+exit /b 1

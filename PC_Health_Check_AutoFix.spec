@@ -1,16 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# Gere o executável com: build_exe.bat  (ou: python -m PyInstaller --clean --noconfirm PC_Health_Check_AutoFix.spec)
+from PyInstaller.utils.hooks import collect_data_files
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=['wmi', 'win32timezone'],
+    # Temas/fontes do CustomTkinter precisam ser empacotados junto
+    datas=collect_data_files('customtkinter'),
+    hiddenimports=['wmi', 'win32timezone', 'pythoncom', 'pywintypes'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pytest'],
     noarchive=False,
     optimize=0,
 )
@@ -26,7 +28,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX desativado: executáveis comprimidos com UPX que pedem Admin geram muitos falsos positivos em antivírus
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
