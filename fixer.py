@@ -1,434 +1,640 @@
-"""
+r"""
 PC Health Check & Auto-Fix - Resolution Engine (Fase 2).
 
 Este módulo executa a resolução automática de problemas do sistema Windows:
-1. Otimização de Armazenamento: Limpeza de %TEMP%, Temp do Windows, Prefetch e esvaziamento da Lixeira.
-2. Correção de SO: Execução silenciosa do SFC (/scannow) e DISM (/RestoreHealth) + reinício de serviços.
-3. Reparo de Rede: Flush DNS, release/renew e redefinição do catálogo Winsock e pilha TCP/IP.
-4. Gerenciamento de Processos: Finalização segura com 1 clique de processos de usuário que causam gargalo.
+1. Ponto de Restauração antes de qualquer modificação (com confirmação se falhar).
+2. Armazenamento: limpeza de %TEMP% e C:\Windows\Temp (arquivos com mais de 24h,
+   sem atravessar junctions) e, opcionalmente, esvaziamento da Lixeira.
+3. Rede: reparo escalonado — flush DNS; renovação DHCP apenas se houver falha;
+   reset de Winsock/TCP-IP apenas se a conectividade não voltar.
+4. SO: DISM /RestoreHealth (se a imagem não estiver saudável) + sfc /scannow,
+   e reinício de serviços essenciais com verificação real do estado.
+5. Processos: encerra apenas processos que comprovadamente causam gargalo,
+   validando que o PID não foi reutilizado.
+6. Windows Update (reset de cache) e atualização de apps via winget.
 
-Tratamento estrito de erros para evitar paradas quando arquivos estiverem em uso.
+Cada ação registra um StepResult com o resultado verificado — nada é
+reportado como sucesso sem checar o código de saída ou o estado final.
 """
 
-import os
-import sys
-import shutil
 import ctypes
-import subprocess
-from typing import List, Dict, Any, Callable
+import os
+import re
+import sys
+import threading
+import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 try:
     import psutil
 except ImportError:
     psutil = None
 
-from diagnostics import CRITICAL_SYSTEM_PROCESSES, DiagnosticResult
+from diagnostics import (
+    CRITICAL_SYSTEM_PROCESSES, TEMP_MIN_AGE_HOURS, DiagnosticResult, ProcessInfo,
+    check_dns, check_internet_tcp, own_process_tree_pids, parse_sfc_output,
+)
+from utils import (
+    SFC_ENCODING, delete_file, get_protected_paths, get_temp_dirs, iter_old_files,
+    remove_empty_dirs, run_cmd, run_powershell, stream_cmd,
+)
+
+# Códigos de retorno conhecidos
+REBOOT_REQUIRED_CODE = 3010
+WINGET_NO_APPLICABLE_UPDATE = 0x8A15002B
+E_UNEXPECTED = -2147418113  # SHEmptyRecycleBinW quando a Lixeira já está vazia
+
+WINUPDATE_SERVICES = ["wuauserv", "bits", "cryptsvc"]
+
+
+@dataclass
+class FixOptions:
+    """Ações selecionadas pelo usuário para a Fase 2."""
+    create_restore: bool = True
+    clean_temp: bool = True
+    empty_recycle_bin: bool = False
+    fix_network: bool = True
+    fix_os: bool = True
+    kill_procs: bool = False
+    update_winget: bool = False
+    reset_winupdate: bool = False
+
+
+# Opções que exigem privilégios de Administrador
+ADMIN_ONLY_OPTIONS = {"create_restore", "fix_network", "fix_os", "reset_winupdate"}
+
+
+@dataclass
+class StepResult:
+    """Resultado verificado de uma etapa do Auto-Fix."""
+    name: str
+    status: str          # "ok", "warning", "error" ou "skipped"
+    detail: str = ""
 
 
 @dataclass
 class FixReport:
     """Relatório estruturado das ações de correção executadas."""
+    steps: List[StepResult] = field(default_factory=list)
     temp_files_deleted: int = 0
+    temp_files_skipped: int = 0
     temp_space_freed_mb: float = 0.0
     recycle_bin_cleared: bool = False
-    prefetch_cleared: bool = False
+    restore_point_created: bool = False
+    network_repaired: bool = False
     sfc_executed: bool = False
-    sfc_success: bool = False
+    sfc_result: Optional[str] = None
     dism_executed: bool = False
     dism_success: bool = False
-    network_repaired: bool = False
     services_restarted: List[str] = field(default_factory=list)
     killed_processes: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    restore_point_created = bool = False
     software_updated: bool = False
     winupdate_cache_cleared: bool = False
-    deep_cleanup_executed: bool = False
+    reboot_required: bool = False
+    cancelled: bool = False
+    aborted_reason: Optional[str] = None
+
+    def add(self, name: str, status: str, detail: str = "") -> StepResult:
+        step = StepResult(name, status, detail)
+        self.steps.append(step)
+        return step
+
+    @property
+    def errors(self) -> List[str]:
+        return [f"{s.name}: {s.detail}" for s in self.steps if s.status == "error"]
+
+
+def describe_plan(options: FixOptions, diag: DiagnosticResult) -> List[str]:
+    """Descreve, em linguagem simples, o que será feito e os impactos — usado na confirmação."""
+    lines: List[str] = []
+    if options.create_restore:
+        lines.append("• Criar ponto de restauração (o Windows permite apenas 1 a cada 24h).")
+    if options.clean_temp:
+        lines.append(f"• Apagar arquivos temporários com mais de {TEMP_MIN_AGE_HOURS:.0f}h "
+                     f"(~{diag.temp_files_size_mb:.0f} MB).")
+    if options.empty_recycle_bin:
+        lines.append("• ESVAZIAR A LIXEIRA — os arquivos não poderão ser recuperados.")
+    if options.fix_network:
+        if diag.network_online and diag.dns_ok is not False:
+            lines.append("• Rede: limpar cache DNS (a conexão está funcionando, nada além disso).")
+        else:
+            lines.append("• Rede: reparo escalonado (DNS → renovar IP → reset Winsock/TCP-IP). "
+                         "A conexão pode cair por alguns segundos e o reset exige reiniciar.")
+    if options.fix_os:
+        dism = "DISM /RestoreHealth + " if diag.image_health != "Healthy" else ""
+        lines.append(f"• Reparar o Windows: {dism}sfc /scannow (pode levar de 15 a 40 minutos).")
+        startable = [s["display"] for s in diag.stopped_services if s.get("start_type") != "disabled"]
+        if startable:
+            lines.append(f"• Iniciar serviços parados: {', '.join(startable)}.")
+    if options.kill_procs:
+        if diag.offending_processes:
+            names = ", ".join(f"{p.name} (PID {p.pid})" for p in diag.offending_processes)
+            lines.append(f"• ENCERRAR processos que causam gargalo: {names}. Dados não salvos serão perdidos.")
+        else:
+            lines.append("• Encerrar processos: nenhum processo está causando gargalo — nada será encerrado.")
+    if options.reset_winupdate:
+        lines.append("• Parar o Windows Update e limpar o cache de downloads.")
+    if options.update_winget:
+        lines.append("• Atualizar todos os aplicativos via winget (programas abertos podem ser fechados).")
+    return lines
+
+
+class _ProgressLineFilter:
+    """
+    Repassa linhas de saída ao log, mas reduz barras de progresso (DISM/SFC)
+    a uma linha a cada 10%, evitando milhares de linhas no console.
+    """
+    _PCT_RE = re.compile(r"(\d{1,3})(?:[.,]\d+)?\s*%")
+
+    def __init__(self, prefix: str, log: Callable[[str], None]):
+        self.prefix = prefix
+        self.log = log
+        self.last_bucket = -1
+
+    def __call__(self, line: str) -> None:
+        match = self._PCT_RE.search(line)
+        if match:
+            bucket = int(match.group(1)) // 10
+            if bucket == self.last_bucket:
+                return
+            self.last_bucket = bucket
+            line = f"Progresso: {int(match.group(1))}%"
+        self.log(f"[{self.prefix}] {line}")
+
+
+def _winget_line_filter(log: Callable[[str], None]) -> Callable[[str], None]:
+    """Remove spinners e barras de download do winget."""
+    def _filter(line: str) -> None:
+        if len(line) <= 2 or any(ch in line for ch in "█▒") or re.fullmatch(r"[-\\|/ ]+", line):
+            return
+        log(f"[Winget] {line}")
+    return _filter
+
+
+def _service_status(name: str) -> str:
+    if not psutil:
+        return "unknown"
+    try:
+        return psutil.win_service_get(name).status()
+    except Exception:
+        return "unknown"
+
+
+def _wait_service_status(name: str, wanted: str, timeout: float = 30) -> bool:
+    """Aguarda o serviço atingir o estado desejado (sc start/stop retornam antes de concluir)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _service_status(name) == wanted:
+            return True
+        time.sleep(1)
+    return _service_status(name) == wanted
 
 
 class AutoFixEngine:
     """Motor de resolução automática e otimização para Windows."""
 
-    def __init__(self, log_callback: Callable[[str], None] = None):
+    def __init__(
+        self,
+        log_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        confirm_callback: Optional[Callable[[str, str], bool]] = None,
+    ):
         """
-        Inicializa o AutoFixEngine.
-
         Args:
-            log_callback (Callable): Função para registrar logs de progresso em tempo real.
+            log_callback: Recebe mensagens de log em tempo real.
+            progress_callback: Recebe (etapa_atual, total_etapas, descrição).
+            confirm_callback: Pergunta sim/não ao usuário (título, mensagem) e
+                bloqueia até a resposta. Sem callback, a resposta é "não".
         """
         self.log_callback = log_callback or (lambda msg: None)
+        self.progress_callback = progress_callback or (lambda i, n, label: None)
+        self.confirm_callback = confirm_callback or (lambda title, msg: False)
 
     def _log(self, message: str) -> None:
-        """Envia mensagem ao callback de log."""
         self.log_callback(message)
 
+    # ------------------------------------------------------- Ponto de restauração
+
+    def create_restore_point(self, report: FixReport) -> bool:
+        """
+        Cria um Ponto de Restauração e confirma que ele realmente existe.
+
+        O Checkpoint-Computer retorna sucesso mesmo quando o Windows recusa criar
+        o ponto (limite de 1 a cada 24h), então comparamos o número de sequência
+        antes e depois.
+        """
+        self._log("[Auto-Fix] Criando Ponto de Restauração do Sistema...")
+        script = r"""
+try {
+    try { Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop } catch {}
+    $prev = (Get-ComputerRestorePoint | Measure-Object -Property SequenceNumber -Maximum).Maximum
+    Checkpoint-Computer -Description 'PCHealthCheck AutoFix' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop -WarningAction SilentlyContinue
+    $last = Get-ComputerRestorePoint | Sort-Object SequenceNumber | Select-Object -Last 1
+    if (-not $last) { 'NONE' }
+    elseif ($last.SequenceNumber -gt $prev) { 'CREATED' }
+    else {
+        $age = (Get-Date) - $last.ConvertToDateTime($last.CreationTime)
+        if ($age.TotalHours -lt 24) { 'RECENT|' + [int]$age.TotalHours } else { 'NONE' }
+    }
+} catch { 'ERROR|' + $_.Exception.Message }
+"""
+        res = run_powershell(script, timeout=300)
+        last_line = res.output.strip().splitlines()[-1] if res.output.strip() else ""
+
+        if last_line == "CREATED":
+            report.restore_point_created = True
+            report.add("Ponto de restauração", "ok", "Criado com sucesso")
+            self._log("[OK] Ponto de restauração criado com sucesso.")
+            return True
+        if last_line.startswith("RECENT|"):
+            hours = last_line.split("|", 1)[1]
+            report.restore_point_created = True
+            report.add("Ponto de restauração", "ok", f"Já existe um ponto criado há {hours}h (limite do Windows: 1 a cada 24h)")
+            self._log(f"[OK] O Windows não cria outro ponto em menos de 24h; será usado o ponto existente (criado há {hours}h).")
+            return True
+
+        reason = (last_line.split("|", 1)[1] if last_line.startswith("ERROR|")
+                  else res.error or "a Proteção do Sistema pode estar desativada")
+        report.add("Ponto de restauração", "error", reason)
+        self._log(f"[-] Ponto de restauração NÃO foi criado: {reason}")
+        return False
+
+    # ------------------------------------------------------------- Armazenamento
+
     def clean_storage(self, report: FixReport) -> None:
+        r"""
+        Remove arquivos com mais de 24h de %TEMP% e C:\Windows\Temp.
+
+        - Não segue junctions/symlinks (evita apagar arquivos fora do TEMP).
+        - Ignora a pasta de extração do próprio .exe (PyInstaller _MEIxxxx).
+        - Arquivos em uso são contabilizados como ignorados, sem travar o app.
         """
-        Otimiza o armazenamento limpando:
-        - Pasta %TEMP% do usuário
-        - Pasta C:\Windows\Temp
-        - Pasta C:\Windows\Prefetch (requer Admin)
-        - Lixeira do Windows (via ctypes ou PowerShell)
-        
-        Arquivos em uso no momento são ignorados silenciosamente sem travar o app.
-        """
-        self._log("[Auto-Fix] Iniciando limpeza de armazenamento e arquivos temporários...")
-
-        folders_to_clean = []
-        if "TEMP" in os.environ:
-            folders_to_clean.append(os.environ["TEMP"])
-        win_temp = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Temp")
-        if os.path.exists(win_temp):
-            folders_to_clean.append(win_temp)
-
-        total_deleted = 0
-        total_freed_bytes = 0
-
-        # 1. Limpeza de Pastas Temp
-        for folder in folders_to_clean:
-            if not os.path.exists(folder):
-                continue
+        self._log("[Auto-Fix] Iniciando limpeza de arquivos temporários...")
+        protected = get_protected_paths()
+        deleted, skipped, freed = 0, 0, 0
+        for folder in get_temp_dirs():
             self._log(f"[*] Limpando diretório: {folder}")
-            try:
-                for root, dirs, files in os.walk(folder, topdown=False):
-                    for file_name in files:
-                        file_path = os.path.join(root, file_name)
-                        try:
-                            file_size = os.path.getsize(file_path)
-                            os.remove(file_path)
-                            total_deleted += 1
-                            total_freed_bytes += file_size
-                        except (PermissionError, OSError):
-                            continue
+            for path, size in iter_old_files(folder, TEMP_MIN_AGE_HOURS, protected):
+                if delete_file(path):
+                    deleted += 1
+                    freed += size
+                else:
+                    skipped += 1
+            remove_empty_dirs(folder, TEMP_MIN_AGE_HOURS, protected)
 
-                    for dir_name in dirs:
-                        dir_path = os.path.join(root, dir_name)
-                        try:
-                            os.rmdir(dir_path)
-                        except (PermissionError, OSError):
-                            continue
-            except Exception as e:
-                self._log(f"[-] Aviso ao acessar pasta {folder}: {e}")
+        report.temp_files_deleted = deleted
+        report.temp_files_skipped = skipped
+        report.temp_space_freed_mb = round(freed / (1024 * 1024), 2)
+        detail = f"{deleted} arquivos removidos ({report.temp_space_freed_mb} MB); {skipped} em uso ignorados"
+        report.add("Limpeza de temporários", "ok", detail)
+        self._log(f"[OK] Limpeza concluída: {detail}.")
 
-        # 2. Limpeza da pasta Prefetch (C:\Windows\Prefetch)
-        prefetch_path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Prefetch")
-        if os.path.exists(prefetch_path):
-            self._log("[*] Limpando cache do Windows Prefetch...")
-            try:
-                for item in os.listdir(prefetch_path):
-                    fp = os.path.join(prefetch_path, item)
-                    try:
-                        if os.path.isfile(fp):
-                            fsize = os.path.getsize(fp)
-                            os.remove(fp)
-                            total_deleted += 1
-                            total_freed_bytes += fsize
-                    except (PermissionError, OSError):
-                        continue
-                report.prefetch_cleared = True
-            except (PermissionError, OSError) as e:
-                self._log(f"[-] Permissão insuficiente para limpar Prefetch (requer Admin): {e}")
+    def empty_recycle_bin(self, report: FixReport) -> None:
+        self._log("[Auto-Fix] Esvaziando a Lixeira do Windows...")
+        if sys.platform != "win32":
+            report.add("Lixeira", "skipped", "Disponível apenas no Windows")
+            return
+        flags = 0x1 | 0x2 | 0x4  # SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND
+        fn = ctypes.windll.shell32.SHEmptyRecycleBinW
+        fn.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.DWORD]
+        fn.restype = ctypes.c_long  # HRESULT
+        hr = fn(None, None, flags)
+        if hr == 0:
+            report.recycle_bin_cleared = True
+            report.add("Lixeira", "ok", "Esvaziada")
+            self._log("[OK] Lixeira esvaziada.")
+        elif hr == E_UNEXPECTED:
+            report.recycle_bin_cleared = True
+            report.add("Lixeira", "ok", "Já estava vazia")
+            self._log("[OK] A Lixeira já estava vazia.")
+        else:
+            report.add("Lixeira", "error", f"HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+            self._log(f"[-] Falha ao esvaziar a Lixeira (HRESULT 0x{hr & 0xFFFFFFFF:08X}).")
 
-        # 3. Esvaziamento da Lixeira do Windows
-        self._log("[*] Esvaziando a Lixeira do Windows...")
-        recycle_cleared = False
-        if sys.platform == "win32":
-            try:
-                flags = 0x00000001 | 0x00000002 | 0x00000004
-                result = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
-                recycle_cleared = (result == 0)
-            except Exception:
-                try:
-                    ps_cmd = ["powershell", "-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"]
-                    subprocess.run(ps_cmd, capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    recycle_cleared = True
-                except Exception as e:
-                    self._log(f"[-] Falha ao esvaziar lixeira: {e}")
+    # ------------------------------------------------------------- SO / Serviços
 
-        report.recycle_bin_cleared = recycle_cleared
-        report.temp_files_deleted = total_deleted
-        report.temp_space_freed_mb = round(total_freed_bytes / (1024 * 1024), 2)
-        self._log(f"[OK] Limpeza concluída: {total_deleted} arquivos removidos ({report.temp_space_freed_mb} MB liberados).")
-
-    def repair_os_integrity(self, report: FixReport, force_dism: bool = False) -> None:
+    def repair_os_integrity(self, report: FixReport, diag: DiagnosticResult) -> None:
         """
-        Executa reparos de integridade de arquivos do Windows:
-        1. DISM /Online /Cleanup-Image /RestoreHealth (se corrupções forem detectadas)
-        2. sfc /scannow (para substituir arquivos corrompidos por cópias em cache)
+        1. DISM /RestoreHealth — somente se a imagem não foi confirmada como saudável.
+        2. sfc /scannow — substitui arquivos corrompidos pelas cópias do repositório.
         """
         self._log("[Auto-Fix] Iniciando reparo de integridade do Sistema Operacional...")
 
-        if force_dism:
-            self._log("[DISM] Executando: DISM.exe /Online /Cleanup-Image /RestoreHealth...")
-            try:
-                dism_cmd = ["dism.exe", "/Online", "/Cleanup-Image", "/RestoreHealth"]
-                proc = subprocess.Popen(
-                    dism_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
-                for line in proc.stdout:
-                    clean_line = line.strip()
-                    if clean_line:
-                        self._log(f"[DISM] {clean_line}")
-                proc.wait()
-                report.dism_executed = True
-                report.dism_success = (proc.returncode == 0)
-                self._log("[OK] Reparo DISM finalizado com sucesso.")
-            except Exception as e:
-                self._log(f"[-] Erro ao executar DISM: {e}")
-                report.errors.append(f"DISM: {e}")
-
-        self._log("[SFC] Executando sfc /scannow para verificação e reparo automático...")
-        try:
-            sfc_cmd = ["sfc", "/scannow"]
-            proc = subprocess.Popen(
-                sfc_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if diag.image_health == "Healthy":
+            self._log("[DISM] Imagem do Windows saudável — RestoreHealth dispensado.")
+        else:
+            self._log("[DISM] Executando DISM /Online /Cleanup-Image /RestoreHealth...")
+            res = stream_cmd(
+                ["dism.exe", "/Online", "/Cleanup-Image", "/RestoreHealth"],
+                on_line=_ProgressLineFilter("DISM", self._log),
+                timeout=3600,
             )
-            for line in proc.stdout:
-                clean_line = line.strip()
-                if clean_line:
-                    self._log(f"[SFC] {clean_line}")
-            proc.wait()
-            report.sfc_executed = True
-            report.sfc_success = (proc.returncode in (0, 1))
-            self._log("[OK] Verificação SFC concluída.")
-        except Exception as e:
-            self._log(f"[-] Erro ao executar SFC: {e}")
-            report.errors.append(f"SFC: {e}")
+            report.dism_executed = True
+            report.dism_success = res.returncode in (0, REBOOT_REQUIRED_CODE)
+            if res.returncode == REBOOT_REQUIRED_CODE:
+                report.reboot_required = True
+            if report.dism_success:
+                report.add("DISM RestoreHealth", "ok", "Imagem reparada/verificada")
+                self._log("[OK] DISM concluído com sucesso.")
+            else:
+                detail = res.error or f"código de saída {res.returncode}"
+                report.add("DISM RestoreHealth", "error", detail)
+                self._log(f"[-] DISM falhou ({detail}). Consulte C:\\Windows\\Logs\\DISM\\dism.log")
 
-    def restart_stopped_services(self, report: FixReport, stopped_services: List[Dict[str, str]]) -> None:
-        """
-        Tenta inicializar serviços essenciais que foram detectados como parados.
-        """
+        self._log("[SFC] Executando sfc /scannow (pode levar vários minutos)...")
+        res = stream_cmd(
+            ["sfc", "/scannow"],
+            on_line=_ProgressLineFilter("SFC", self._log),
+            timeout=3600,
+            encoding=SFC_ENCODING,
+        )
+        report.sfc_executed = True
+        report.sfc_result = parse_sfc_output(res.output)
+        cbs = r"C:\Windows\Logs\CBS\CBS.log"
+        if report.sfc_result == "ok":
+            report.add("SFC /scannow", "ok", "Nenhuma violação de integridade")
+        elif report.sfc_result == "repaired":
+            report.reboot_required = True
+            report.add("SFC /scannow", "ok", "Arquivos corrompidos reparados (reinicie o PC)")
+        elif report.sfc_result == "unrepairable":
+            report.add("SFC /scannow", "error", f"Há arquivos que não puderam ser reparados — veja {cbs}")
+        else:
+            report.add("SFC /scannow", "warning", res.error or f"resultado não reconhecido (código {res.returncode})")
+        self._log(f"[OK] SFC finalizado: {report.steps[-1].detail}")
+
+    def restart_stopped_services(self, report: FixReport, stopped_services: List[dict]) -> None:
+        """Inicia serviços essenciais parados e confirma que entraram em execução."""
         if not stopped_services:
             return
-
-        self._log("[Auto-Fix] Tentando iniciar serviços essenciais parados...")
+        self._log("[Auto-Fix] Iniciando serviços essenciais parados...")
         for srv in stopped_services:
-            srv_name = srv.get("name")
-            display = srv.get("display", srv_name)
-            self._log(f"[*] Iniciando serviço: {display} ({srv_name})...")
-            try:
-                cmd = ["sc", "start", srv_name]
-                subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=8,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
+            name = srv.get("name")
+            display = srv.get("display", name)
+            if srv.get("start_type") == "disabled":
+                report.add(f"Serviço {display}", "warning",
+                           "Desativado — não foi alterado (pode ter sido desativado por política). Reative em services.msc se necessário.")
+                self._log(f"[!] {display} está DESATIVADO; não será alterado automaticamente.")
+                continue
+            self._log(f"[*] Iniciando serviço: {display} ({name})...")
+            res = run_cmd(["sc", "start", name], timeout=30)
+            if _wait_service_status(name, "running", timeout=30):
                 report.services_restarted.append(display)
-                self._log(f"[OK] Comando de inicialização enviado para: {display}")
-            except Exception as e:
-                self._log(f"[-] Falha ao iniciar serviço {srv_name}: {e}")
+                report.add(f"Serviço {display}", "ok", "Em execução")
+                self._log(f"[OK] {display} em execução.")
+            else:
+                detail = res.error or f"não iniciou (sc código {res.returncode})"
+                report.add(f"Serviço {display}", "error", detail)
+                self._log(f"[-] {display} {detail}.")
 
-    def repair_network(self, report: FixReport) -> None:
+    # -------------------------------------------------------------------- Rede
+
+    def repair_network(self, report: FixReport, diag: DiagnosticResult) -> None:
         """
-        Executa a sequência de reparo de conectividade de rede:
-        - ipconfig /flushdns
-        - ipconfig /release
-        - ipconfig /renew
-        - netsh winsock reset
-        - netsh int ip reset
+        Reparo escalonado — só avança de nível se o problema persistir:
+        1. ipconfig /flushdns (sempre, inofensivo)
+        2. ipconfig /release + /renew (somente sem Internet ou com DNS falhando)
+        3. netsh winsock reset + netsh int ip reset (somente se ainda sem conexão; exige reiniciar)
         """
-        self._log("[Auto-Fix] Executando reparo completo da pilha de rede e DNS...")
+        self._log("[Auto-Fix] Reparo de rede...")
+        res = run_cmd(["ipconfig", "/flushdns"], timeout=30)
+        self._log(f"[*] Cache DNS limpo ({'OK' if res.ok else res.error or f'código {res.returncode}'}).")
 
-        commands = [
-            ("ipconfig /flushdns", ["ipconfig", "/flushdns"], "Limpando cache do resolvedor DNS"),
-            ("ipconfig /release", ["ipconfig", "/release"], "Liberando endereços IP concedidos"),
-            ("ipconfig /renew", ["ipconfig", "/renew"], "Renovando concessões de IP com o roteador/DHCP"),
-            ("netsh winsock reset", ["netsh", "winsock", "reset"], "Redefinindo catálogo Winsock do Windows"),
-            ("netsh int ip reset", ["netsh", "int", "ip", "reset"], "Redefinindo pilha TCP/IP padrão"),
-        ]
+        if diag.network_online and diag.dns_ok is not False:
+            detail = "Conexão funcionando: apenas o cache DNS foi limpo"
+            if not diag.network_healthy:
+                detail += ". Latência alta/perda de pacotes costuma ser física (Wi-Fi, cabo, provedor) — não se resolve com reset de software"
+            report.network_repaired = res.ok
+            report.add("Rede", "ok" if res.ok else "warning", detail)
+            self._log(f"[OK] {detail}.")
+            return
 
-        success_count = 0
-        for label, cmd_args, desc in commands:
-            self._log(f"[*] {desc} ({label})...")
-            try:
-                proc = subprocess.run(
-                    cmd_args,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
-                out = (proc.stdout or "").strip()
-                if out:
-                    first_line = out.split("\n")[0]
-                    self._log(f"    -> {first_line}")
-                success_count += 1
-            except Exception as e:
-                self._log(f"[-] Erro ao executar {label}: {e}")
-                report.errors.append(f"{label}: {e}")
+        if check_internet_tcp() is not None and check_dns():
+            report.network_repaired = True
+            report.add("Rede", "ok", "Conectividade restaurada após limpar o cache DNS")
+            self._log("[OK] Conectividade restaurada após limpar o cache DNS.")
+            return
 
-        report.network_repaired = (success_count >= 3)
-        self._log("[OK] Reparo de rede finalizado.")
+        self._log("[*] Renovando concessão de IP (DHCP)...")
+        run_cmd(["ipconfig", "/release"], timeout=30)
+        renew = run_cmd(["ipconfig", "/renew"], timeout=90)
+        time.sleep(3)
+        if check_internet_tcp() is not None and check_dns():
+            report.network_repaired = True
+            report.add("Rede", "ok", "Conectividade restaurada após renovar o IP")
+            self._log("[OK] Conectividade restaurada após renovar o IP.")
+            return
+        if not renew.ok:
+            self._log(f"[-] ipconfig /renew: {renew.error or f'código {renew.returncode}'}")
 
-    def kill_offending_processes(self, report: FixReport, process_list: List[Any]) -> None:
+        self._log("[*] Redefinindo Winsock e pilha TCP/IP...")
+        failures = []
+        for args in (["netsh", "winsock", "reset"], ["netsh", "int", "ip", "reset"]):
+            r = run_cmd(args, timeout=60)
+            if not r.ok:
+                failures.append(f"{' '.join(args)}: {r.error or f'código {r.returncode}'}")
+        if failures:
+            report.add("Rede", "error", "; ".join(failures))
+            self._log(f"[-] Falha no reset de rede: {'; '.join(failures)}")
+        else:
+            report.network_repaired = True
+            report.reboot_required = True
+            report.add("Rede", "warning", "Winsock e TCP/IP redefinidos — REINICIE o PC para concluir")
+            self._log("[OK] Winsock e TCP/IP redefinidos. É necessário reiniciar o computador.")
+
+    # --------------------------------------------------------------- Processos
+
+    def kill_offending_processes(self, report: FixReport, process_list: List[ProcessInfo]) -> None:
         """
-        Encerra com segurança processos de usuário que estão causando gargalo de CPU ou RAM.
-        Ignora estritamente processos críticos do sistema para evitar BSOD.
+        Encerra apenas os processos identificados como causadores de gargalo.
+        Antes de encerrar, confirma que o PID ainda pertence ao mesmo processo
+        (nome + horário de criação), evitando matar um processo que reutilizou o PID.
         """
         self._log("[Auto-Fix] Gerenciando processos ofensores de CPU/Memória...")
         if not psutil:
+            report.add("Processos", "skipped", "psutil indisponível")
+            return
+        if not process_list:
+            report.add("Processos", "skipped", "Nenhum processo causando gargalo")
+            self._log("[*] Nenhum processo está causando gargalo — nada a encerrar.")
             return
 
-        for proc_item in process_list:
-            pid = getattr(proc_item, "pid", None)
-            name = getattr(proc_item, "name", "Desconhecido")
-            is_critical = getattr(proc_item, "is_critical", True)
-
-            if is_critical or name.lower() in CRITICAL_SYSTEM_PROCESSES or (pid and pid <= 4):
-                self._log(f"[Protegido] Processo crítico ignorado por segurança: {name} (PID: {pid})")
+        own = own_process_tree_pids()
+        for info in process_list:
+            label = f"{info.name} (PID: {info.pid})"
+            if info.is_critical or info.name.lower() in CRITICAL_SYSTEM_PROCESSES or info.pid <= 4 or info.pid in own:
+                self._log(f"[Protegido] Processo ignorado por segurança: {label}")
                 continue
-
             try:
-                p = psutil.Process(pid)
+                p = psutil.Process(info.pid)
+                if p.name() != info.name or abs(p.create_time() - info.create_time) > 1:
+                    self._log(f"[*] {label} já foi encerrado (o PID agora pertence a outro processo).")
+                    continue
                 p.terminate()
                 try:
-                    p.wait(timeout=2)
+                    p.wait(timeout=5)
                 except psutil.TimeoutExpired:
                     p.kill()
+                report.killed_processes.append(label)
+                report.add(f"Encerrar {info.name}", "ok", f"PID {info.pid}")
+                self._log(f"[OK] Processo encerrado: {label}")
+            except psutil.NoSuchProcess:
+                self._log(f"[*] {label} já havia sido encerrado.")
+            except psutil.Error as e:
+                report.add(f"Encerrar {info.name}", "error", str(e))
+                self._log(f"[-] Não foi possível encerrar {label}: {e}")
 
-                report.killed_processes.append(f"{name} (PID: {pid})")
-                self._log(f"[OK] Processo ofensor encerrado: {name} (PID: {pid})")
-            except Exception as e:
-                self._log(f"[-] Não foi possível encerrar {name} (PID: {pid}): {e}")
+    # ----------------------------------------------------------- Windows Update
+
+    def repair_windows_update(self, report: FixReport) -> None:
+        """Para os serviços do Windows Update, limpa o cache de downloads e restaura os serviços."""
+        self._log("[Auto-Fix] Redefinindo cache do Windows Update...")
+        was_running = {svc: _service_status(svc) == "running" for svc in WINUPDATE_SERVICES}
+
+        not_stopped = []
+        for svc in WINUPDATE_SERVICES:
+            run_cmd(["sc", "stop", svc], timeout=30)
+            if not _wait_service_status(svc, "stopped", timeout=45):
+                not_stopped.append(svc)
+
+        if not_stopped:
+            detail = f"Serviços não pararam: {', '.join(not_stopped)} — cache não foi limpo"
+            report.add("Windows Update", "error", detail)
+            self._log(f"[-] {detail}.")
+        else:
+            win_dir = os.environ.get("SystemRoot", r"C:\Windows")
+            download_dir = os.path.join(win_dir, "SoftwareDistribution", "Download")
+            deleted, skipped = 0, 0
+            if os.path.isdir(download_dir):
+                for path, _ in iter_old_files(download_dir, 0):
+                    if delete_file(path):
+                        deleted += 1
+                    else:
+                        skipped += 1
+                remove_empty_dirs(download_dir)
+            report.winupdate_cache_cleared = skipped == 0
+            status = "ok" if skipped == 0 else "warning"
+            detail = f"{deleted} arquivos de cache removidos" + (f"; {skipped} bloqueados" if skipped else "")
+            report.add("Windows Update", status, detail + ". Abra Configurações > Windows Update e clique em 'Verificar atualizações'.")
+            self._log(f"[OK] Cache do Windows Update limpo: {detail}.")
+
+        # cryptsvc é automático e sempre deve voltar; os demais voltam se estavam rodando
+        for svc in WINUPDATE_SERVICES:
+            if svc == "cryptsvc" or was_running[svc]:
+                run_cmd(["sc", "start", svc], timeout=30)
+                if not _wait_service_status(svc, "running", timeout=30):
+                    report.add(f"Serviço {svc}", "error", "Não voltou a executar após o reset")
+                    self._log(f"[-] O serviço {svc} não voltou a executar.")
+
+    # ------------------------------------------------------------------ Winget
+
+    def update_software_winget(self, report: FixReport) -> None:
+        """Atualiza aplicativos via winget com saída em tempo real e timeout."""
+        self._log("[Auto-Fix] Buscando e instalando atualizações de software (Winget)...")
+        res = stream_cmd(
+            ["winget", "upgrade", "--all", "--silent",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            on_line=_winget_line_filter(self._log),
+            timeout=3600,
+            encoding="utf-8",
+        )
+        if res.returncode is None:
+            if res.timed_out:
+                report.add("Winget", "error", res.error)
+                self._log(f"[-] Winget interrompido: {res.error}.")
+            else:
+                report.add("Winget", "skipped", "winget não encontrado (instale o 'Instalador de Aplicativo' pela Microsoft Store)")
+                self._log("[-] Winget não encontrado no sistema. Recurso ignorado.")
+            return
+
+        code = res.returncode & 0xFFFFFFFF
+        if code in (0, WINGET_NO_APPLICABLE_UPDATE):
+            report.software_updated = True
+            report.add("Winget", "ok", "Aplicativos atualizados" if code == 0 else "Nenhuma atualização disponível")
+            self._log("[OK] Atualização via winget concluída.")
+        else:
+            report.add("Winget", "warning", f"Alguns pacotes falharam (código 0x{code:08X}); veja o log")
+            self._log(f"[!] Winget terminou com código 0x{code:08X}: alguns pacotes podem não ter sido atualizados.")
+
+    # ---------------------------------------------------------------- Execução
 
     def run_auto_fix(
         self,
         diag_result: DiagnosticResult,
-        fix_storage: bool = True,
-        fix_os: bool = True,
-        fix_network: bool = True,
-        kill_procs: bool = False,
-        create_restore: bool = True,
-        update_winget: bool = False,
-        reset_winupdate: bool = False
+        options: FixOptions,
+        cancel_event: Optional[threading.Event] = None,
     ) -> FixReport:
         """
-        Executa a Fase 2 completa de resolução automática com base no diagnóstico anterior.
+        Executa a Fase 2 com base no diagnóstico anterior.
+
+        O cancelamento é verificado entre as etapas (interromper SFC/DISM/instaladores
+        no meio poderia deixar o sistema em estado inconsistente).
         """
         report = FixReport()
+        cancel_event = cancel_event or threading.Event()
         self._log("=== INICIANDO FASE 2: RESOLUÇÃO AUTOMÁTICA (AUTO-FIX) ===")
 
-        if create_restore:
-            self.create_restore_point(report)
+        steps = []
+        if options.clean_temp:
+            steps.append(("clean_temp", "Limpando temporários", lambda: self.clean_storage(report)))
+        if options.empty_recycle_bin:
+            steps.append(("empty_recycle_bin", "Esvaziando a Lixeira", lambda: self.empty_recycle_bin(report)))
+        if options.kill_procs:
+            steps.append(("kill_procs", "Encerrando processos ofensores",
+                          lambda: self.kill_offending_processes(report, diag_result.offending_processes)))
+        if options.fix_network:
+            steps.append(("fix_network", "Reparando rede", lambda: self.repair_network(report, diag_result)))
+        if options.fix_os:
+            steps.append(("fix_os", "Reparando o Windows (DISM/SFC)", lambda: self.repair_os_integrity(report, diag_result)))
+            steps.append(("fix_os", "Iniciando serviços",
+                          lambda: self.restart_stopped_services(report, diag_result.stopped_services)))
+        if options.reset_winupdate:
+            steps.append(("reset_winupdate", "Redefinindo Windows Update", lambda: self.repair_windows_update(report)))
+        if options.update_winget:
+            steps.append(("update_winget", "Atualizando aplicativos (winget)", lambda: self.update_software_winget(report)))
 
-        if fix_storage:
-            self.clean_storage(report)
+        total = len(steps) + (1 if options.create_restore else 0)
+        index = 0
 
-        if kill_procs:
-            offenders = diag_result.top_cpu_processes + diag_result.top_ram_processes
-            unique_offenders = {p.pid: p for p in offenders}.values()
-            self.kill_offending_processes(report, list(unique_offenders))
+        if options.create_restore:
+            self.progress_callback(index, total, "Criando ponto de restauração")
+            index += 1
+            if not diag_result.elevated:
+                report.add("Ponto de restauração", "skipped", "Requer Administrador")
+            elif not self.create_restore_point(report):
+                proceed = self.confirm_callback(
+                    "Ponto de restauração não criado",
+                    "Não foi possível criar um ponto de restauração.\n\n"
+                    "Deseja continuar com as correções mesmo assim?\n"
+                    "(Sem ponto de restauração não será possível desfazer as alterações.)",
+                )
+                if not proceed:
+                    report.aborted_reason = "Cancelado pelo usuário: ponto de restauração não foi criado"
+                    self._log(f"[!] {report.aborted_reason}.")
+                    return report
 
-        if fix_network or not diag_result.network_online:
-            self.repair_network(report)
+        for key, label, action in steps:
+            if cancel_event.is_set():
+                report.cancelled = True
+                self._log("[!] Operação cancelada pelo usuário. Etapas restantes não foram executadas.")
+                break
+            self.progress_callback(index, total, label)
+            index += 1
+            if key in ADMIN_ONLY_OPTIONS and not diag_result.elevated:
+                report.add(label, "skipped", "Requer Administrador")
+                self._log(f"[*] {label}: ignorado (requer Administrador).")
+                continue
+            try:
+                action()
+            except Exception as e:  # uma etapa com erro não deve impedir as demais
+                report.add(label, "error", f"Erro inesperado: {e}")
+                self._log(f"[-] Erro inesperado em '{label}': {e}")
 
-        if fix_os:
-            need_dism = not diag_result.sfc_integrity_ok
-            self.repair_os_integrity(report, force_dism=need_dism)
-            self.restart_stopped_services(report, diag_result.stopped_services)
-
-        if reset_winupdate:
-            self.repair_windows_update_and_drivers(report)
-
-        if update_winget:
-            self.update_software_winget(report)
-
-        self._log("=== FASE 2 CONCLUÍDA COM SUCESSO ===")
+        self.progress_callback(total, total, "Concluído")
+        errors = len(report.errors)
+        status = "CANCELADA" if report.cancelled else ("CONCLUÍDA COM ERROS" if errors else "CONCLUÍDA")
+        self._log(f"=== FASE 2 {status} ({errors} erro(s)) ===")
+        if report.reboot_required:
+            self._log("[!] REINICIE o computador para concluir os reparos.")
         return report
-
-    def create_restore_point(self, report: FixReport) -> None:
-        """Cria um Ponto de Restauração no Windows antes das modificações."""
-        self._log("[Auto-Fix] Criando Ponto de Restauração do Sistema...")
-        try:
-            ps_cmd = [
-                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                "Enable-ComputerRestore -Drive 'C:\'; Checkpoint-Computer -Description 'PCHealthCheck_AutoFix' -RestorePointType 'MODIFY_SETTINGS'"
-            ]
-            proc = subprocess.run(ps_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if proc.returncode == 0:
-                report.restore_point_created = True
-                self._log("[OK] Ponto de restauração criado com sucesso.")
-            else:
-                self._log("[-] Aviso: A proteção do sistema pode estar desativada. Ponto não criado.")
-        except Exception as e:
-            self._log(f"[-] Falha ao criar ponto de restauração: {e}")
-
-    def update_software_winget(self, report: FixReport) -> None:
-        """Atualiza softwares via winget capturando logs em tempo real na interface."""
-        self._log("[Auto-Fix] Buscando e instalando atualizações de software (Winget)...")
-        try:
-            # Transformamos a lista em uma única string textual para rodar no shell
-            cmd = "winget upgrade --all --silent --force --accept-package-agreements --accept-source-agreements"
-            
-            # Popen iterando saída do console
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                shell=True,  # <--- ESSA É A CHAVE PARA RECONHECER O WINGET
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            
-            # Envia cada linha de download/instalação diretamente para o terminal da GUI
-            for line in proc.stdout:
-                clean_line = line.strip()
-                if clean_line:
-                    self._log(f"[Winget] {clean_line}")
-                    
-            proc.wait()
-            
-            if proc.returncode == 0:
-                self._log("[OK] Todos os softwares gerenciados pelo winget estão atualizados.")
-                report.software_updated = True
-            else:
-                self._log("[OK] Ciclo de atualização do winget concluído (alguns pacotes podem exigir reinício).")
-                report.software_updated = True
-                
-        except FileNotFoundError:
-            self._log("[-] Winget não encontrado no sistema. Recurso ignorado.")
-        except Exception as e:
-            self._log(f"[-] Erro ao executar winget: {e}")
-
-    def repair_windows_update_and_drivers(self, report: FixReport) -> None:
-        """Para os serviços de atualização, limpa o cache de downloads corrompidos e reinicia."""
-        self._log("[Auto-Fix] Redefinindo cache do Windows Update (corrige falhas de download/drivers)...")
-        try:
-            # Para os serviços BITS e WUAUSERV
-            for svc in ["wuauserv", "bits", "cryptsvc"]:
-                subprocess.run(["sc", "stop", svc], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            
-            # Limpa o diretório de Download
-            win_dir = os.environ.get("SystemRoot", "C:\\Windows")
-            soft_dist_dl = os.path.join(win_dir, "SoftwareDistribution", "Download")
-            
-            if os.path.exists(soft_dist_dl):
-                try:
-                    shutil.rmtree(soft_dist_dl, ignore_errors=True)
-                    os.makedirs(soft_dist_dl, exist_ok=True)
-                except OSError:
-                    pass
-            
-            # Inicia os serviços novamente
-            for svc in ["wuauserv", "bits", "cryptsvc"]:
-                subprocess.run(["sc", "start", svc], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            
-            # Força o Windows Update a buscar novas atualizações (incluindo drivers) via UsoClient
-            subprocess.run(["UsoClient.exe", "StartScan"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            
-            report.winupdate_cache_cleared = True
-            self._log("[OK] Cache de atualizações limpo. Varredura de drivers/updates iniciada em segundo plano.")
-        except Exception as e:
-            self._log(f"[-] Falha ao redefinir o Windows Update: {e}")
